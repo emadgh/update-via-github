@@ -489,21 +489,94 @@ fn sanitize_component(value: &str) -> String {
     }
 }
 
-fn version_tuple(value: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = value.trim_start_matches(['v', 'V']).split('.');
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VersionIdentifier {
+    Numeric(u64),
+    Text(String),
+}
+
+fn parse_version(value: &str) -> Option<((u32, u32, u32), Vec<VersionIdentifier>)> {
+    let normalized = value.trim().trim_start_matches(['v', 'V']);
+    let normalized = normalized.split('+').next()?;
+    let (core, prerelease) = normalized
+        .split_once('-')
+        .map(|(core, prerelease)| (core, Some(prerelease)))
+        .unwrap_or((normalized, None));
+    let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().unwrap_or("0").parse().ok()?;
-    let patch_text = parts.next().unwrap_or("0");
-    let patch = patch_text
-        .split(|ch: char| !ch.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()?;
-    Some((major, minor, patch))
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let prerelease = prerelease
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .split('.')
+                .map(|identifier| {
+                    identifier
+                        .parse::<u64>()
+                        .map(VersionIdentifier::Numeric)
+                        .unwrap_or_else(|_| VersionIdentifier::Text(identifier.to_ascii_lowercase()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(((major, minor, patch), prerelease))
+}
+
+fn compare_prerelease(
+    remote: &[VersionIdentifier],
+    current: &[VersionIdentifier],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (remote.is_empty(), current.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    for index in 0..remote.len().max(current.len()) {
+        match (remote.get(index), current.get(index)) {
+            (Some(VersionIdentifier::Numeric(left)), Some(VersionIdentifier::Numeric(right))) => {
+                let ordering = left.cmp(right);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            (Some(VersionIdentifier::Numeric(_)), Some(VersionIdentifier::Text(_))) => {
+                return Ordering::Less;
+            }
+            (Some(VersionIdentifier::Text(_)), Some(VersionIdentifier::Numeric(_))) => {
+                return Ordering::Greater;
+            }
+            (Some(VersionIdentifier::Text(left)), Some(VersionIdentifier::Text(right))) => {
+                let ordering = left.cmp(right);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_versions(remote: &str, current: &str) -> Option<std::cmp::Ordering> {
+    let (remote_core, remote_pre) = parse_version(remote)?;
+    let (current_core, current_pre) = parse_version(current)?;
+    let core_ordering = remote_core.cmp(&current_core);
+    if core_ordering != std::cmp::Ordering::Equal {
+        return Some(core_ordering);
+    }
+    Some(compare_prerelease(&remote_pre, &current_pre))
 }
 
 fn is_newer(remote: &str, current: &str) -> bool {
-    matches!((version_tuple(remote), version_tuple(current)), (Some(remote), Some(current)) if remote > current)
+    matches!(compare_versions(remote, current), Some(std::cmp::Ordering::Greater))
 }
 
 fn http_get(
@@ -651,6 +724,11 @@ mod tests {
         assert!(is_newer("3.0.0", "2.9.9"));
         assert!(!is_newer("v2.2.0", "2.2.0"));
         assert!(!is_newer("v2.1.9", "2.2.0"));
+        assert!(is_newer("v0.3.0", "0.3.0-alpha.6"));
+        assert!(is_newer("v0.3.0-alpha.7", "0.3.0-alpha.6"));
+        assert!(is_newer("v0.3.0-beta.1", "0.3.0-alpha.99"));
+        assert!(!is_newer("v0.3.0-alpha.5", "0.3.0-alpha.6"));
+        assert!(!is_newer("v0.3.0-alpha.6", "0.3.0"));
     }
 
     #[test]
