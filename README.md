@@ -5,7 +5,7 @@ A small Windows-only Rust crate for self-updating desktop applications from GitH
 It centralizes:
 
 - checking `releases/latest`
-- semantic `major.minor.patch` version comparison
+- SemVer-style version comparison, including prerelease precedence
 - selecting a named `.exe` release asset
 - download progress reporting
 - executable sanity checks (`MZ` + minimum size)
