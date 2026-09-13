@@ -1,0 +1,39 @@
+name: Apply ZIP bundle updater support
+
+on:
+  push:
+    branches: [feat/zip-bundle-updates]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/zip-bundle-updates
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: x86_64-pc-windows-msvc
+      - name: Apply source migration
+        run: python scripts/apply-zip-bundle-support.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Check
+        run: cargo check --target x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+      - name: Commit generated source
+        shell: bash
+        run: |
+          if ! git diff --quiet -- src/lib.rs; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/lib.rs
+            git commit -m "Support ZIP bundle updates"
+            git push origin HEAD:feat/zip-bundle-updates
+          fi
