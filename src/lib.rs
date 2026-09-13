@@ -288,10 +288,7 @@ pub fn check_latest_release(config: &UpdateConfig) -> Result<Option<UpdateInfo>,
     }
 
     Ok(Some(UpdateInfo {
-        version: release
-            .tag_name
-            .trim_start_matches(['v', 'V'])
-            .to_owned(),
+        version: release.tag_name.trim_start_matches(['v', 'V']).to_owned(),
         release_url: release.html_url,
         download_url: executable.browser_download_url.clone(),
         checksum_url,
@@ -317,9 +314,7 @@ where
         HttpPayload::NotFound => return Err("Update asset returned HTTP 404.".to_owned()),
     };
 
-    if bytes.len() < config.min_executable_size || !bytes.starts_with(b"MZ") {
-        return Err("Downloaded update is not a valid Windows executable.".to_owned());
-    }
+    validate_downloaded_asset(config, &bytes)?;
 
     if let Some(expected_checksum) = expected_checksum {
         let actual_checksum = sha256_hex(&bytes);
@@ -332,8 +327,9 @@ where
 
     let safe_version = sanitize_component(&info.version);
     let safe_app = sanitize_component(&config.app_name);
+    let extension = if is_zip_bundle(config) { "zip" } else { "exe" };
     let path = std::env::temp_dir().join(format!(
-        "{safe_app}-update-{}-{safe_version}.exe",
+        "{safe_app}-update-{}-{safe_version}.{extension}",
         std::process::id()
     ));
     fs::write(&path, bytes).map_err(|err| format!("Cannot store downloaded update: {err}"))?;
@@ -348,13 +344,41 @@ pub fn apply_update(config: &UpdateConfig, source: &Path) -> Result<(), String> 
     let current_exe = std::env::current_exe()
         .map_err(|err| format!("Cannot locate current executable: {err}"))?;
     let safe_app = sanitize_component(&config.app_name);
-    let script = std::env::temp_dir().join(format!(
-        "{safe_app}-updater-{}.ps1",
-        std::process::id()
-    ));
-    fs::write(&script, updater_script())
+    let script =
+        std::env::temp_dir().join(format!("{safe_app}-updater-{}.ps1", std::process::id()));
+    let script_body = if is_zip_bundle(config) {
+        bundle_updater_script()
+    } else {
+        updater_script()
+    };
+    fs::write(&script, script_body)
         .map_err(|err| format!("Cannot create updater script: {err}"))?;
     launch_updater(&script, source, &current_exe)
+}
+
+fn is_zip_bundle(config: &UpdateConfig) -> bool {
+    config.asset_name.to_ascii_lowercase().ends_with(".zip")
+}
+
+fn validate_downloaded_asset(config: &UpdateConfig, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < config.min_executable_size {
+        return Err(format!(
+            "Downloaded update is too small ({} bytes; minimum is {}).",
+            bytes.len(),
+            config.min_executable_size
+        ));
+    }
+    if is_zip_bundle(config) {
+        let zip_magic = bytes.starts_with(b"PK\x03\x04")
+            || bytes.starts_with(b"PK\x05\x06")
+            || bytes.starts_with(b"PK\x07\x08");
+        if !zip_magic {
+            return Err("Downloaded update is not a valid ZIP bundle.".to_owned());
+        }
+    } else if !bytes.starts_with(b"MZ") {
+        return Err("Downloaded update is not a valid Windows executable.".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_config(config: &UpdateConfig) -> Result<(), String> {
@@ -471,6 +495,40 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
 "#
 }
 
+fn bundle_updater_script() -> &'static str {
+    r#"param([int]$TargetPid, [string]$Source, [string]$Destination)
+$Stage = Join-Path ([IO.Path]::GetTempPath()) ("update-via-github-bundle-{0}-{1}" -f $TargetPid, [Guid]::NewGuid().ToString("N"))
+try {
+    New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+    Expand-Archive -LiteralPath $Source -DestinationPath $Stage -Force -ErrorAction Stop
+    $ExeName = [IO.Path]::GetFileName($Destination)
+    $StagedExe = Join-Path $Stage $ExeName
+    if (-not (Test-Path -LiteralPath $StagedExe -PathType Leaf)) {
+        throw "Update ZIP does not contain $ExeName at its root."
+    }
+    Wait-Process -Id $TargetPid -ErrorAction SilentlyContinue
+    $DestinationDir = Split-Path -Parent $Destination
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        try {
+            Get-ChildItem -LiteralPath $Stage -Force | Where-Object { $_.Name -ne $ExeName } | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination $DestinationDir -Recurse -Force -ErrorAction Stop
+            }
+            Copy-Item -LiteralPath $StagedExe -Destination $Destination -Force -ErrorAction Stop
+            Start-Process -FilePath $Destination
+            Remove-Item -LiteralPath $Source -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+            exit 0
+        } catch {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+} catch {
+    Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+}
+"#
+}
+
 fn split_https_url(url: &str) -> Option<(&str, &str)> {
     let rest = url.strip_prefix("https://")?;
     let slash = rest.find('/')?;
@@ -518,7 +576,9 @@ fn parse_version(value: &str) -> Option<((u32, u32, u32), Vec<VersionIdentifier>
                     identifier
                         .parse::<u64>()
                         .map(VersionIdentifier::Numeric)
-                        .unwrap_or_else(|_| VersionIdentifier::Text(identifier.to_ascii_lowercase()))
+                        .unwrap_or_else(|_| {
+                            VersionIdentifier::Text(identifier.to_ascii_lowercase())
+                        })
                 })
                 .collect::<Vec<_>>()
         })
@@ -576,7 +636,10 @@ fn compare_versions(remote: &str, current: &str) -> Option<std::cmp::Ordering> {
 }
 
 fn is_newer(remote: &str, current: &str) -> bool {
-    matches!(compare_versions(remote, current), Some(std::cmp::Ordering::Greater))
+    matches!(
+        compare_versions(remote, current),
+        Some(std::cmp::Ordering::Greater)
+    )
 }
 
 fn http_get(
@@ -687,7 +750,9 @@ fn http_get(
                 break;
             }
             if body.len().saturating_add(available as usize) > max_size {
-                return Err(format!("Update response exceeds the {max_size}-byte limit."));
+                return Err(format!(
+                    "Update response exceeds the {max_size}-byte limit."
+                ));
             }
             let start = body.len();
             body.resize(start + available as usize, 0);
@@ -742,5 +807,33 @@ mod tests {
     fn sanitizes_temp_file_components() {
         assert_eq!(sanitize_component("My App/1"), "MyApp1");
         assert_eq!(sanitize_component(""), "app");
+    }
+
+    #[test]
+    fn infers_zip_bundle_from_asset_name() {
+        let zip = UpdateConfig::new("owner/repo", "app-win64.zip", "1.0.0");
+        let exe = UpdateConfig::new("owner/repo", "app.exe", "1.0.0");
+        assert!(is_zip_bundle(&zip));
+        assert!(!is_zip_bundle(&exe));
+    }
+
+    #[test]
+    fn validates_executable_and_zip_payload_magic() {
+        let exe = UpdateConfig::new("owner/repo", "app.exe", "1.0.0").with_min_executable_size(2);
+        let zip =
+            UpdateConfig::new("owner/repo", "app-win64.zip", "1.0.0").with_min_executable_size(4);
+        assert!(validate_downloaded_asset(&exe, b"MZ").is_ok());
+        assert!(validate_downloaded_asset(&exe, b"PK").is_err());
+        assert!(validate_downloaded_asset(&zip, b"PK\x03\x04payload").is_ok());
+        assert!(validate_downloaded_asset(&zip, b"MZpayload").is_err());
+    }
+
+    #[test]
+    fn bundle_script_copies_sidecars_before_replacing_executable() {
+        let script = bundle_updater_script();
+        let sidecars = script.find("Get-ChildItem").unwrap();
+        let executable = script.find("Copy-Item -LiteralPath $StagedExe").unwrap();
+        assert!(sidecars < executable);
+        assert!(script.contains("Expand-Archive"));
     }
 }
